@@ -6,63 +6,100 @@ from .serializers import ImageUploadSerializer
 from .models import OnlineProductImage, OfflineProductImage, History
 from rest_framework import permissions
 import easyocr
+import torch.nn.functional as F
 from rest_framework.permissions import AllowAny
 from accounts.models import User
 from .serializers import HistorySerializer
 from .models import OnlineProductImage, OfflineProductImage, ProductReview
 from .serializers import ProductReviewSerializer, ProductReviewCreateSerializer, OnlineProductImageSerializer, OfflineProductImageSerializer
 from rest_framework import status, generics
+import os
+import torch
+import torchvision.transforms as transforms
+from torchvision import models
+from PIL import Image
+import tempfile
+import os  
+import torch
+import clip
+from PIL import Image
 
 class ExtractAndMatchAPIView(APIView):
-    
-    authentication_classes = []  # Disable CSRF-related auth
-    permission_classes = [AllowAny]
-
+    authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
+    SIMILARITY_THRESHOLD = 0.75
+
+    def load_clip_model(self):
+        try:
+            self.clip_model, self.preprocess = clip.load("ViT-B/32")
+            self.clip_model.eval()
+        except Exception as e:
+            print("Error loading CLIP model:", e)
+
+    def get_image_embedding(self, image_path):
+        try:
+            image = self.preprocess(Image.open(image_path).convert("RGB")).unsqueeze(0)
+            with torch.no_grad():
+                embedding = self.clip_model.encode_image(image)
+            return embedding.squeeze()
+        except Exception as e:
+            print("Error creating embedding:", e)
+
+    def compute_similarity(self, emb1, emb2):
+        # Cosine similarity returns a tensor, get the scalar float with .item()
+        return F.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0)).item()
+
     def post(self, request, *args, **kwargs):
-        print("here")
-        email = request.data.get('email') 
-        
-        if email:
-            print(f"Email received: {email}")
-        else:
-            print("No email received.")
-        
+        self.load_clip_model()
+
+        email = request.data.get('email')
         serializer = ImageUploadSerializer(data=request.data)
+
         if serializer.is_valid():
+            uploaded_image = serializer.validated_data['image']
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
+                for chunk in uploaded_image.chunks():
+                    temp_file.write(chunk)
+                temp_file_path = temp_file.name
+
             try:
-                # Save the uploaded image to a temporary file
-                uploaded_image = serializer.validated_data['image']
+                try:
+                    uploaded_embedding = self.get_image_embedding(temp_file_path)
+                except Exception as e:
+                    print(e)
+                matched_online = []
+                matched_offline = []
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
-                    for chunk in uploaded_image.chunks():
-                        temp_file.write(chunk)
-                    temp_file_path = temp_file.name
+                for product in OnlineProductImage.objects.all():
+                    if not product.image:
+                        print("image not found")
+                        continue
+                    db_embedding = self.get_image_embedding(product.image.path)
+                    similarity = self.compute_similarity(uploaded_embedding, db_embedding)
+                    print("similarity online",similarity)
+                    if similarity > self.SIMILARITY_THRESHOLD:
+                        matched_online.append((similarity, product))
 
-                # Perform OCR using EasyOCR
-                reader = easyocr.Reader(['en'])  # Specify the language(s)
-                extracted_text = reader.readtext(temp_file_path, detail=0)
+                for product in OfflineProductImage.objects.all():
+                    if not product.image:
+                        print("image not found")
+                        continue
+                    db_embedding = self.get_image_embedding(product.image.path)
+                    similarity = self.compute_similarity(uploaded_embedding, db_embedding)
+                    print("similarity",similarity)
+                    if similarity > self.SIMILARITY_THRESHOLD:
+                        matched_offline.append((similarity, product))
 
-                # Clean up temporary file after OCR
-                temp_file.close()
+                # Sort descending by similarity
+                matched_online.sort(key=lambda x: x[0], reverse=True)
+                matched_offline.sort(key=lambda x: x[0], reverse=True)
 
-                if not extracted_text:
-                    return Response({"message": "No text detected in the image"}, status=status.HTTP_204_NO_CONTENT)
+                results = {}
 
-                extracted_words = set(" ".join(extracted_text).split())
-
-                # Query matching products
-                online_products = OnlineProductImage.objects.filter(
-                    name__iregex=r'\b(' + '|'.join(extracted_words) + r')\b'
-                )
-                offline_products = OfflineProductImage.objects.filter(
-                    name__iregex=r'\b(' + '|'.join(extracted_words) + r')\b'
-                )
-
-                # Prepare the results
-                results = {
-                    "online_products": [
+                if matched_online:
+                    results["online_products"] = [
                         {
                             "id": product.id,
                             "name": product.name,
@@ -72,10 +109,13 @@ class ExtractAndMatchAPIView(APIView):
                             "storetype": product.storetype,
                             "websitelink": product.websitelink,
                             "storename": product.storename,
+                            "similarity": round(sim, 2)
                         }
-                        for product in online_products
-                    ] if online_products.exists() else "No online products found",
-                    "offline_products": [
+                        for sim, product in matched_online
+                    ]
+
+                if matched_offline:
+                    results["offline_products"] = [
                         {
                             "id": product.id,
                             "name": product.name,
@@ -85,40 +125,46 @@ class ExtractAndMatchAPIView(APIView):
                             "storetype": product.storetype,
                             "storelocation": product.storelocation,
                             "storename": product.storename,
+                            "similarity": round(sim, 2)
                         }
-                        for product in offline_products
-                    ] if offline_products.exists() else "No offline products found",
-                }
-                try:
-                    if email:
-                        user = User.objects.get(email=email) 
-                        if online_products.exists() or offline_products.exists():
-                                for product in online_products:
-                                    History.objects.create(
-                                        name=product.name,
-                                        image=product.image,
-                                        price=product.price,
-                                        user=user,
-                                        store="Online"
-                                    )
-                                for product in offline_products:
-                                    History.objects.create(
-                                        name=product.name,
-                                        image=product.image,
-                                        price=product.price,
-                                        user=user,
-                                        store="Offline"
-                                    )
+                        for sim, product in matched_offline
+                    ]
 
-                    print(results)
-                except Exception as e:
-                    print(e)
+                if not results:
+                    results["message"] = "No matching products found."
 
+                # Save history for user if email provided
+                if email:
+                    try:
+                        user = User.objects.get(email=email)
+                        for _, product in matched_online:
+                            History.objects.create(
+                                name=product.name,
+                                image=product.image,
+                                price=product.price,
+                                user=user,
+                                store="Online"
+                            )
+                        for _, product in matched_offline:
+                            History.objects.create(
+                                name=product.name,
+                                image=product.image,
+                                price=product.price,
+                                user=user,
+                                store="Offline"
+                            )
+                    except Exception as e:
+                        print("Error saving history:", e)
+
+                os.remove(temp_file_path)
                 return Response(results, status=status.HTTP_200_OK)
-            except Exception as e:
-                return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+            except Exception as e:
+                os.remove(temp_file_path)
+                print(e)
+                return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class HistoryByEmailAPIView(APIView):
     authentication_classes = []  # Disable CSRF-related auth
